@@ -151,7 +151,63 @@ function doPost(e) {
         .setMimeType(ContentService.MimeType.JSON);
     }
 
-    // 【模式 B】：點餐送出
+    // 【模式 C】：刪除單筆訂單
+    if (data.action === "deleteOrder") {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const sheet = ss.getSheetByName(SHEET_ORDERS);
+      if (sheet) {
+        const rows = sheet.getDataRange().getValues();
+        for (let i = rows.length - 1; i >= 1; i--) {
+          const rowId = String(rows[i][0]);
+          const rowDate = normalizeDateStr(rows[i][1]);
+          const rowSeat = Number(rows[i][3]);
+          if ((data.id && rowId === String(data.id)) || (data.targetDateStr && rowDate === normalizeDateStr(data.targetDateStr) && rowSeat === Number(data.seat))) {
+            sheet.deleteRow(i + 1);
+          }
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({ status: "success", message: "訂單已從雲端刪除" }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 【模式 D】：清除指定日期的所有訂單
+    if (data.action === "clearDayOrders") {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const sheet = ss.getSheetByName(SHEET_ORDERS);
+      if (sheet) {
+        const rows = sheet.getDataRange().getValues();
+        const targetDate = data.targetDateStr ? normalizeDateStr(data.targetDateStr) : null;
+        const targetDayOfWeek = data.dayOfWeek ? Number(data.dayOfWeek) : null;
+        const dayKeys = { '週一': 1, '週二': 2, '週三': 3, '週四': 4, '週五': 5 };
+
+        for (let i = rows.length - 1; i >= 1; i--) {
+          const rowDate = normalizeDateStr(rows[i][1]);
+          const rowDayName = String(rows[i][2] || '');
+          const rowDayOfWeek = dayKeys[rowDayName] || 0;
+
+          if (targetDate && rowDate === targetDate) {
+            sheet.deleteRow(i + 1);
+          } else if (targetDayOfWeek && rowDayOfWeek === targetDayOfWeek) {
+            sheet.deleteRow(i + 1);
+          }
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({ status: "success", message: "指定日訂單已從雲端清除" }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 【模式 E】：清除全部訂單
+    if (data.action === "clearAllOrders") {
+      const ss = SpreadsheetApp.getActiveSpreadsheet();
+      const sheet = ss.getSheetByName(SHEET_ORDERS);
+      if (sheet && sheet.getLastRow() > 1) {
+        sheet.deleteRows(2, sheet.getLastRow() - 1);
+      }
+      return ContentService.createTextOutput(JSON.stringify({ status: "success", message: "全部訂單已從雲端清除" }))
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 【模式 F】：點餐送出
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     let sheet = ss.getSheetByName(SHEET_ORDERS);
     

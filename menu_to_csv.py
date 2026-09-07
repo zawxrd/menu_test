@@ -3,6 +3,8 @@ import sys
 import json
 import base64
 import csv
+import time
+import subprocess
 from pathlib import Path
 
 def print_help():
@@ -39,6 +41,23 @@ PROMPT_TEXT = """
 3. price 請填整數數字（若未標價請填 0）。
 """
 
+def clean_and_parse_json(raw_text: str) -> dict:
+    s = raw_text.strip()
+    if s.startswith("```"):
+        lines = s.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        s = "\n".join(lines).strip()
+    
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1:
+        s = s[start:end+1]
+
+    return json.loads(s)
+
 def parse_with_gemini(api_key: str, file_path: Path) -> dict:
     """使用 Google Gemini 原生 REST API (自動列舉可用模型並發送)"""
     import urllib.request
@@ -73,7 +92,6 @@ def parse_with_gemini(api_key: str, file_path: Path) -> dict:
         }
     }
 
-    # 1. 查詢該 Key 真正支援的模型清單
     available_models = []
     for ver in ["v1beta", "v1"]:
         try:
@@ -82,17 +100,10 @@ def parse_with_gemini(api_key: str, file_path: Path) -> dict:
                 data = json.loads(resp.read().decode("utf-8"))
                 for m in data.get("models", []):
                     if "generateContent" in m.get("supportedGenerationMethods", []):
-                        # m["name"] 格式通常為 "models/gemini-..."
-                        name = m["name"]
-                        available_models.append((ver, name))
+                        available_models.append((ver, m["name"]))
         except Exception:
             pass
 
-    # 依優先順序排序: flash > pro
-    def score_model(item):
-        ver, name = item
-        score = 0
-    # 排除非視覺/非多模態模型 (如 tts, embedding, audio, imagen 等)
     def is_vision_model(name: str) -> bool:
         low = name.lower()
         if any(bad in low for bad in ["-tts", "audio", "embed", "imagen", "search"]):
@@ -101,7 +112,6 @@ def parse_with_gemini(api_key: str, file_path: Path) -> dict:
 
     available_models = [m for m in available_models if is_vision_model(m[1])]
 
-    # 依優先順序排序: 穩定正式版 flash 優先
     def score_model(item):
         ver, name = item
         score = 0
@@ -116,7 +126,6 @@ def parse_with_gemini(api_key: str, file_path: Path) -> dict:
     available_models.sort(key=score_model, reverse=True)
 
     if not available_models:
-        # 若無法獲取列表，提供官方最通用的多模態模型
         available_models = [
             ("v1beta", "models/gemini-1.5-flash"),
             ("v1", "models/gemini-1.5-flash"),
@@ -148,82 +157,14 @@ def parse_with_gemini(api_key: str, file_path: Path) -> dict:
         except urllib.error.HTTPError as e:
             err_msg = e.read().decode("utf-8", errors="ignore")
             last_err = f"{ver}/{model_name} (HTTP {e.code}): {err_msg}"
-            # 只有在 API Key 本身無效 (403/API_KEY_INVALID) 才直接中止
             if "API_KEY_INVALID" in err_msg or "API key not valid" in err_msg:
                 raise RuntimeError(f"API 金鑰無效：{err_msg}")
-            # 其它錯誤 (包含 400 該模型不吃圖片、404 模型未開放等) 繼續嘗試下一個候選模型
             continue
         except Exception as e:
             last_err = str(e)
             continue
 
     raise RuntimeError(f"所有可用模型皆無法產生回應：\n{last_err}")
-
-def parse_with_claude(api_key: str, file_path: Path) -> dict:
-    """使用 Anthropic Claude API"""
-    import urllib.request
-    
-    with open(file_path, "rb") as f:
-        b64_data = base64.b64encode(f.read()).decode("utf-8")
-
-    is_pdf = file_path.suffix.lower() == ".pdf"
-    suffix = file_path.suffix.lower()
-    mime_type = "application/pdf" if is_pdf else f"image/{suffix.replace('.', '')}"
-    if mime_type == "image/jpg":
-        mime_type = "image/jpeg"
-
-    content_block = {
-        "type": "document" if is_pdf else "image",
-        "source": {
-            "type": "base64",
-            "media_type": mime_type,
-            "data": b64_data
-        }
-    }
-
-    req_body = {
-        "model": "claude-3-5-sonnet-20241022",
-        "max_tokens": 2500,
-        "messages": [
-            {
-                "role": "user",
-                "content": [content_block, {"type": "text", "text": PROMPT_TEXT}]
-            }
-        ]
-    }
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(req_body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01"
-        }
-    )
-
-    with urllib.request.urlopen(req) as resp:
-        res_data = json.loads(resp.read().decode("utf-8"))
-        text = "".join([b.get("text", "") for b in res_data.get("content", [])])
-
-    return clean_and_parse_json(text)
-
-def clean_and_parse_json(raw_text: str) -> dict:
-    s = raw_text.strip()
-    if s.startswith("```"):
-        lines = s.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        s = "\n".join(lines).strip()
-    
-    start = s.find("{")
-    end = s.rfind("}")
-    if start != -1 and end != -1:
-        s = s[start:end+1]
-
-    return json.loads(s)
 
 def json_to_csv(data: dict, out_csv_path: Path):
     """將解析後的 JSON 轉成點餐系統標準 CSV"""
@@ -243,8 +184,6 @@ def json_to_csv(data: dict, out_csv_path: Path):
         writer.writerow(["星期", "餐點名稱", "價格"])
         writer.writerows(rows)
 
-    # 同時在專案目錄儲存一份 menu.json (包含更新時間戳記，供網頁端比對與自動載入)
-    import time
     project_dir = Path(__file__).parent
     out_json_path = project_dir / "menu.json"
     payload = {
@@ -257,24 +196,46 @@ def json_to_csv(data: dict, out_csv_path: Path):
     return len(rows), out_json_path
 
 def try_git_push(repo_dir: Path):
-    """嘗試執行 git add, commit, push 自動同步至 GitHub"""
-    import subprocess
+    """嘗試強健地同步並推送到 GitHub"""
     try:
-        # 檢查是否為 git repo
         check = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=repo_dir, capture_output=True, text=True)
         if check.returncode != 0:
             print("\nℹ️ 當前目錄尚未初始化 git 倉庫，略過自動推送到 GitHub。")
             return
 
         print("\n📦 正在自動同步至 GitHub...")
-        subprocess.run(["git", "add", "menu.json"], cwd=repo_dir, check=True)
-        subprocess.run(["git", "commit", "-m", "chore: auto update menu.json from AI tool"], cwd=repo_dir, check=True)
-        push_res = subprocess.run(["git", "push"], cwd=repo_dir, capture_output=True, text=True)
         
+        # 1. 先將遠端歷史抓取下來 (fetch)
+        subprocess.run(["git", "fetch", "origin"], cwd=repo_dir, capture_output=True, text=True)
+
+        # 2. 加入本地生成的 menu.json 並 commit
+        subprocess.run(["git", "add", "menu.json"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "chore: auto update menu.json from AI tool"], cwd=repo_dir, capture_output=True, text=True)
+
+        # 3. 嘗試以 -X ours 模式 merge 遠端變更，自動以本地生成的 menu.json 為主
+        merge_res = subprocess.run(["git", "merge", "origin/main", "-m", "chore: merge remote changes", "-X", "ours"], cwd=repo_dir, capture_output=True, text=True)
+        
+        # 若預設分支名稱是 master，備用處理
+        if merge_res.returncode != 0:
+            subprocess.run(["git", "merge", "origin/master", "-m", "chore: merge remote changes", "-X", "ours"], cwd=repo_dir, capture_output=True, text=True)
+
+        # 4. 執行推送
+        push_res = subprocess.run(["git", "push", "origin", "HEAD:main"], cwd=repo_dir, capture_output=True, text=True)
+        if push_res.returncode != 0:
+            # 備用推送到預設分支
+            push_res = subprocess.run(["git", "push"], cwd=repo_dir, capture_output=True, text=True)
+
         if push_res.returncode == 0:
             print("✨ 成功推送到 GitHub！GitHub Pages 上的菜單已自動完成更新！")
         else:
-            print(f"⚠️ git push 失敗 (請手動檢查遠端設定): {push_res.stderr.strip()}")
+            # 若常規 merge/push 依然受阻，採用強行覆蓋 (Force Push) 保障菜單更新
+            print("⚠️ 偵測到遠端歷史不一致，正在執行強制同步...")
+            force_push = subprocess.run(["git", "push", "-u", "origin", "main", "--force"], cwd=repo_dir, capture_output=True, text=True)
+            if force_push.returncode == 0:
+                print("✨ 成功強制推送到 GitHub！菜單已完成更新！")
+            else:
+                print(f"⚠️ git push 失敗 (請檢查權限與遠端設定): {force_push.stderr.strip()}")
+
     except Exception as e:
         print(f"⚠️ 自動 Git 同步略過: {e}")
 
@@ -318,32 +279,34 @@ def main():
     else:
         out_csv = input_file.parent / f"{input_file.stem}_menu.csv"
 
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    claude_key = os.environ.get("ANTHROPIC_API_KEY")
+    KEY_FILE = Path(__file__).parent / ".gemini_api_key"
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not gemini_key and KEY_FILE.exists():
+        try:
+            gemini_key = KEY_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
 
-    if not gemini_key and not claude_key:
-        print("\n⚠️ 找不到 API 金鑰環境變數。")
-        print("請選擇你要使用的 API 並輸入金鑰：")
-        print("1. Google Gemini API (推薦)")
-        print("2. Anthropic Claude API")
-        choice = input("請輸入選項 (1 或 2): ").strip()
-        if choice == "2":
-            claude_key = input("請輸入 ANTHROPIC_API_KEY: ").strip()
-        else:
-            gemini_key = input("請輸入 GEMINI_API_KEY: ").strip()
+    if not gemini_key:
+        print("\n🔑 固定使用 Google Gemini 視覺識別模型。")
+        print("首次使用請輸入您的 GEMINI_API_KEY：")
+        print("（輸入後系統會自動安全儲存在本機，下次執行無需再輸入）")
+        gemini_key = input("👉 請輸入 GEMINI_API_KEY: ").strip()
+        if gemini_key:
+            try:
+                KEY_FILE.write_text(gemini_key, encoding="utf-8")
+                print("✅ API Key 已成功儲存於本機記憶檔！下次執行將自動讀取。")
+            except Exception as e:
+                print(f"⚠️ 無法寫入金鑰記憶檔: {e}")
 
-    print(f"\n🚀 正在解析檔案: {input_file.name} ...")
+    if not gemini_key:
+        print("❌ 未提供 Gemini API 金鑰，終止。")
+        return
+
+    print(f"\n🚀 正在使用 Google Gemini 解析檔案: {input_file.name} ...")
 
     try:
-        if gemini_key:
-            print("👉 使用 Google Gemini 進行視覺識別...")
-            result = parse_with_gemini(gemini_key, input_file)
-        elif claude_key:
-            print("👉 使用 Claude 進行視覺識別...")
-            result = parse_with_claude(claude_key, input_file)
-        else:
-            print("❌ 未提供任何 API 金鑰，終止。")
-            return
+        result = parse_with_gemini(gemini_key, input_file)
 
         count, json_file = json_to_csv(result, out_csv)
         print(f"\n🎉 轉換成功！共提取 {count} 項餐點。")

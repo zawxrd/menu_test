@@ -547,6 +547,8 @@ let state = {
   reportTime: '12:00',
   googleSheetUrl: '',
   adminPassword: 'admin1234',
+  isManualMenu: false,
+  menuClearedAt: 0,
   currentPage: 'user',
   currentAdminTab: 'menu',
   selectedAdminDay: getDefaultWeekday(),
@@ -962,6 +964,16 @@ async function syncOrdersFromCloud(isManual = false) {
       if (cloudSettings.adminEmail !== undefined) state.adminEmail = String(cloudSettings.adminEmail);
       if (cloudSettings.reportTime) state.reportTime = cleanCloudTimeStr(cloudSettings.reportTime);
       if (cloudSettings.adminPassword) state.adminPassword = String(cloudSettings.adminPassword);
+      if (cloudSettings.menuClearedAt) {
+        const cloudClearedAt = Number(cloudSettings.menuClearedAt);
+        if (cloudClearedAt > (state.menuUpdatedAt || 0)) {
+          state.menuClearedAt = cloudClearedAt;
+          state.weeklyMenu = { 1:[], 2:[], 3:[], 4:[], 5:[] };
+          state.isManualMenu = true;
+          if (state.currentPage === 'user') renderUserPage();
+          if (state.currentPage === 'admin') renderAdminPage();
+        }
+      }
       populateSettingsUI();
     }
 
@@ -1015,12 +1027,30 @@ async function syncOrdersFromCloud(isManual = false) {
 }
 
 function cancelOrder(orderId) {
+  const order = state.orders.find(o => o.id === orderId);
   if (!confirm('確定取消此筆訂單？')) return;
   state.orders = state.orders.filter(o => o.id !== orderId);
   saveState();
   renderAdminOrders();
   renderMealStats();
   updateStats();
+
+  // 同步從 Google 試算表刪除
+  if (state.googleSheetUrl && order) {
+    try {
+      fetch(state.googleSheetUrl, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'deleteOrder',
+          id: orderId,
+          targetDateStr: order.targetDateStr,
+          seat: order.seat
+        })
+      }).catch(e => console.log('雲端刪除訂單提示:', e));
+    } catch(e) {}
+  }
 }
 
 // ===================== MENU MANAGEMENT =====================
@@ -1145,30 +1175,98 @@ function changePassword() {
 }
 
 function clearSelectedDayOrders() {
-  const dayName = DAY_NAMES[state.selectedAdminOrderDay];
-  if (!confirm(`確定清除 ${dayName} 的所有訂單？`)) return;
-  state.orders = state.orders.filter(o => o.dayOfWeek !== state.selectedAdminOrderDay);
+  const dayName = state.selectedAdminOrderDay === 0 ? "全部" : DAY_NAMES[state.selectedAdminOrderDay];
+  if (!confirm(`確定清除 ${dayName} 的訂單？`)) return;
+
+  const targetOrders = state.selectedAdminOrderDay === 0
+    ? state.orders
+    : state.orders.filter(o => o.dayOfWeek === state.selectedAdminOrderDay);
+  const targetDateStr = targetOrders.length > 0 ? targetOrders[0].targetDateStr : null;
+
+  if (state.selectedAdminOrderDay === 0) {
+    state.orders = [];
+  } else {
+    state.orders = state.orders.filter(o => o.dayOfWeek !== state.selectedAdminOrderDay);
+  }
+
   saveState();
   renderAdminPage();
+
+  // 同步通知 Google 試算表刪除
+  if (state.googleSheetUrl) {
+    try {
+      fetch(state.googleSheetUrl, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: state.selectedAdminOrderDay === 0 ? 'clearAllOrders' : 'clearDayOrders',
+          dayOfWeek: state.selectedAdminOrderDay,
+          targetDateStr: targetDateStr
+        })
+      }).catch(e => console.log('雲端清除指定日訂單提示:', e));
+    } catch(e) {}
+  }
 }
 
 function clearWeeklyMenu() {
-  if (!confirm('確定清除「週一至週五」菜單？')) return;
+  if (!confirm('確定清除「週一至週五」全週菜單？')) return;
+  const now = Date.now();
   state.weeklyMenu = { 1:[], 2:[], 3:[], 4:[], 5:[] };
-  state.isManualMenu = false;
-  state.menuUpdatedAt = Date.now();
+  state.isManualMenu = true;
+  state.menuUpdatedAt = now;
+  state.menuClearedAt = now;
   saveState();
   renderAdminPage();
+
+  // 同步通知雲端設定：菜單已由管理者清空
+  if (state.googleSheetUrl) {
+    try {
+      fetch(state.googleSheetUrl, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'saveSettings',
+          settings: { menuClearedAt: now }
+        })
+      }).catch(e => console.log('雲端清空菜單提示:', e));
+    } catch(e) {}
+  }
 }
 
 function fullReset() {
   if (!confirm('確定全部重置（包含菜單、訂單）？此操作不可復原。')) return;
+  const now = Date.now();
   state.weeklyMenu = { 1:[], 2:[], 3:[], 4:[], 5:[] };
   state.orders = [];
-  state.isManualMenu = false;
-  state.menuUpdatedAt = 0;
+  state.isManualMenu = true;
+  state.menuUpdatedAt = now;
+  state.menuClearedAt = now;
   saveState();
   renderAdminPage();
+
+  // 同步清空 Google 試算表全部訂單與設定菜單清空
+  if (state.googleSheetUrl) {
+    try {
+      fetch(state.googleSheetUrl, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'clearAllOrders' })
+      }).catch(e => console.log('雲端全部清空提示:', e));
+
+      fetch(state.googleSheetUrl, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'saveSettings',
+          settings: { menuClearedAt: now }
+        })
+      }).catch(e => {});
+    } catch(e) {}
+  }
 }
 
 // ===================== EXPORT & REPORT =====================
@@ -1370,10 +1468,25 @@ function parseCSVMenu(text, fileName, status) {
   }
 
   state.menuUpdatedAt = Date.now();
+  state.menuClearedAt = 0; // 重設清空標記，恢復正常顯示
   state.isManualMenu = true; // 鎖定保護：手動修改/上傳後，不受線上舊檔案影響
   saveState();
   renderMenuList();
   updateStats();
+
+  if (state.googleSheetUrl) {
+    try {
+      fetch(state.googleSheetUrl, {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'saveSettings',
+          settings: { menuClearedAt: 0 }
+        })
+      }).catch(e => {});
+    } catch(e) {}
+  }
 
   if (totalAdded === 0) {
     status.textContent = `⚠️ 未能從「${fileName}」匯入任何餐點，請確認 CSV 格式正確。`;
@@ -1401,7 +1514,12 @@ async function fetchOnlineMenu() {
     const onlineUpdatedAt = Number(onlineData.updatedAt) || 0;
     const onlineMenu = onlineData.menu || onlineData;
 
-    // 如果本機已手動編輯過菜單，且線上的更新時間沒有更新，絕不覆蓋本機
+    // 1. 若管理者已清空菜單，且線上沒有發布比清空時間更新的菜單，絕不載入
+    if (state.menuClearedAt && (!onlineUpdatedAt || state.menuClearedAt >= onlineUpdatedAt)) {
+      return;
+    }
+
+    // 2. 如果本機已手動編輯過菜單，且線上的更新時間沒有更新，絕不覆蓋本機
     if (state.isManualMenu && (!onlineUpdatedAt || state.menuUpdatedAt >= onlineUpdatedAt)) {
       return;
     }
