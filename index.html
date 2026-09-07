@@ -549,6 +549,7 @@ let state = {
   adminPassword: 'admin1234',
   isManualMenu: false,
   menuClearedAt: 0,
+  menuValidWeekStart: '',
   currentPage: 'user',
   currentAdminTab: 'menu',
   selectedAdminDay: getDefaultWeekday(),
@@ -649,6 +650,18 @@ function doLogin() {
 function closeModal(id) { document.getElementById(id).classList.remove('show'); }
 
 // ===================== USER PAGE =====================
+function getThisWeekMondayStr() {
+  const today = new Date();
+  const day = today.getDay(); // 0=日, 1=週一...6=週六
+  const diff = day === 0 ? -6 : 1 - day; // 往前找週一
+  const monday = new Date(today);
+  monday.setDate(today.getDate() + diff);
+  const y = monday.getFullYear();
+  const m = String(monday.getMonth() + 1).padStart(2, '0');
+  const d = String(monday.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 function renderUserPage() {
   const target = getActiveTarget();
   const seatSel = document.getElementById('seat-select');
@@ -670,15 +683,32 @@ function renderUserPage() {
     seatSel.innerHTML += `<option value="${i}">${i}</option>`;
   }
 
-  const activeMenu = state.weeklyMenu[target.dayOfWeek] || [];
+  // ── 有效週驗證 ──
+  // 若菜單帶有 validWeekStart，且不屬於本週，視為「尚未開放」
+  const thisWeekMonday = getThisWeekMondayStr();
+  const menuWeekStart = state.menuValidWeekStart || '';
+  const menuExpired = menuWeekStart && menuWeekStart !== thisWeekMonday;
+
+  const activeMenu = menuExpired ? [] : (state.weeklyMenu[target.dayOfWeek] || []);
   mealSel.innerHTML = '<option value="">-- 請選擇餐點 --</option>';
   activeMenu.forEach(item => {
     mealSel.innerHTML += `<option value="${item.id}">${item.name}（$${item.price}）</option>`;
   });
 
   const hasMenu = activeMenu.length > 0;
-  document.getElementById('user-menu-empty').style.display = hasMenu ? 'none' : 'flex';
+  const emptyEl = document.getElementById('user-menu-empty');
   document.getElementById('user-form').style.display = hasMenu ? 'block' : 'none';
+
+  if (!hasMenu) {
+    emptyEl.style.display = 'flex';
+    if (menuExpired) {
+      emptyEl.textContent = `📅 本週菜單尚未發布（上份菜單有效週：${menuWeekStart}）`;
+    } else {
+      emptyEl.textContent = '📋 今日尚無菜單';
+    }
+  } else {
+    emptyEl.style.display = 'none';
+  }
 
   const userCutoff = document.getElementById('user-cutoff-display');
   if (userCutoff) userCutoff.textContent = state.cutoffTime || '12:00';
@@ -1216,6 +1246,7 @@ function clearWeeklyMenu() {
   state.isManualMenu = true;
   state.menuUpdatedAt = now;
   state.menuClearedAt = now;
+  state.menuValidWeekStart = ''; // 清空有效週，避免殘留舊週資訊
   saveState();
   renderAdminPage();
 
@@ -1469,6 +1500,7 @@ function parseCSVMenu(text, fileName, status) {
 
   state.menuUpdatedAt = Date.now();
   state.menuClearedAt = 0; // 重設清空標記，恢復正常顯示
+  state.menuValidWeekStart = getThisWeekMondayStr(); // 手動上傳菜單，有效週設為本週
   state.isManualMenu = true; // 鎖定保護：手動修改/上傳後，不受線上舊檔案影響
   saveState();
   renderMenuList();
@@ -1502,7 +1534,11 @@ function parseCSVMenu(text, fileName, status) {
 }
 
 // ===================== AUTO LOAD MENU FROM GITHUB =====================
-async function fetchOnlineMenu() {
+function isWeeklyMenuEmpty() {
+  return ![1,2,3,4,5].some(d => state.weeklyMenu[d] && state.weeklyMenu[d].length > 0);
+}
+
+async function fetchOnlineMenu(force = false) {
   try {
     // 加上 timestamp 防止瀏覽器快取舊菜單
     const res = await fetch('./menu.json?t=' + Date.now());
@@ -1510,17 +1546,20 @@ async function fetchOnlineMenu() {
     const onlineData = await res.json();
     if (!onlineData) return;
 
-    // 支援直接是菜單物件，或是包含 timestamp 的封裝物件 { updatedAt: ..., menu: ... }
+    // 支援直接是菜單物件，或是包含 timestamp 的封裝物件 { updatedAt: ..., validWeekStart: ..., menu: ... }
     const onlineUpdatedAt = Number(onlineData.updatedAt) || 0;
+    const onlineValidWeekStart = onlineData.validWeekStart || '';
     const onlineMenu = onlineData.menu || onlineData;
 
     // 1. 若管理者已清空菜單，且線上沒有發布比清空時間更新的菜單，絕不載入
-    if (state.menuClearedAt && (!onlineUpdatedAt || state.menuClearedAt >= onlineUpdatedAt)) {
+    if (!force && state.menuClearedAt && (!onlineUpdatedAt || state.menuClearedAt >= onlineUpdatedAt)) {
       return;
     }
 
     // 2. 如果本機已手動編輯過菜單，且線上的更新時間沒有更新，絕不覆蓋本機
-    if (state.isManualMenu && (!onlineUpdatedAt || state.menuUpdatedAt >= onlineUpdatedAt)) {
+    //    但若本機菜單是空的，不論如何都嘗試從線上載入
+    const localIsEmpty = isWeeklyMenuEmpty();
+    if (!force && !localIsEmpty && state.isManualMenu && (!onlineUpdatedAt || state.menuUpdatedAt >= onlineUpdatedAt)) {
       return;
     }
 
@@ -1534,7 +1573,7 @@ async function fetchOnlineMenu() {
         '4': 4, '週四': 4, '周四': 4, 'thursday': 4,
         '5': 5, '週五': 5, '周五': 5, 'friday': 5
       };
-      
+
       let hasValidItems = false;
       for (const [key, items] of Object.entries(onlineMenu)) {
         const d = dayKeys[key.toLowerCase ? key.toLowerCase() : key];
@@ -1552,6 +1591,7 @@ async function fetchOnlineMenu() {
       if (hasValidItems) {
         state.weeklyMenu = mapped;
         if (onlineUpdatedAt) state.menuUpdatedAt = onlineUpdatedAt;
+        if (onlineValidWeekStart) state.menuValidWeekStart = onlineValidWeekStart;
         saveState();
         if (state.currentPage === 'user') renderUserPage();
         if (state.currentPage === 'admin') renderAdminPage();

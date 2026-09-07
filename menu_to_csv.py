@@ -186,8 +186,22 @@ def json_to_csv(data: dict, out_csv_path: Path):
 
     project_dir = Path(__file__).parent
     out_json_path = project_dir / "menu.json"
+
+    # 計算本週週一（若今天是週六/週日則取下週週一）
+    today = time.localtime()
+    weekday = today.tm_wday  # 0=週一, 6=週日
+    if weekday <= 4:
+        # 週一到週五：取本週週一
+        days_to_monday = weekday
+    else:
+        # 週六=5, 週日=6：取下週週一
+        days_to_monday = -(weekday - 7)
+    monday_ts = time.mktime(today) - days_to_monday * 86400
+    monday_str = time.strftime("%Y-%m-%d", time.localtime(monday_ts))
+
     payload = {
         "updatedAt": int(time.time() * 1000),
+        "validWeekStart": monday_str,
         "menu": data
     }
     with open(out_json_path, "w", encoding="utf-8") as f:
